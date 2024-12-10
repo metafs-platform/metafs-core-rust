@@ -1,44 +1,13 @@
 {
-  "mappings": [
-    {
-      "path": "/example.txt",
-      "target": "/real/target/example.txt",
-      "permissions": {
-        "owner": 1000,
-        "group": 1000,
-        "mode": 420
-      }
-    },
-    {
-      "path": "/restricted-folder",
-      "target": "/real/target/restricted-folder",
-      "permissions": {
-        "owner": 1000,
-        "group": 1000,
-        "mode": 448
-      }
-    },
-    {
-      "path": "/readonly.txt",
-      "target": "/real/target/readonly.txt",
-      "permissions": {
-        "owner": 1000,
-        "group": 1000,
-        "mode": 292
-      }
-    },
-    {
-      "path": "/same-permissions-file.txt",
-      "target": "/real/target/same-permissions-file.txt"
-    },
-    {
-      "path": "/another-example.txt",
-      "target": "/real/target/another-example.txt",
-      "permissions": {
-        "owner": 2000,
-        "group": 2000,
-        "mode": 332
-      }
-    }
-  ]
+  "/example.txt": {
+    "path": "/example.txt",
+    "target": "/underlying_fs/real_example.txt"
+  },
+  "/example2.txt": {
+    "path": "/example2.txt"
+  },
+  "/some/dir": {
+    "path": "/some/dir",
+    "target": "/underlying_fs/some/dir"
+  }
 }
