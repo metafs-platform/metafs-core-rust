@@ -10,7 +10,11 @@ use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyWrite, Request,
 };
+use inotify::{Inotify, WatchMask};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::FileTypeExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     ffi::OsStr,
@@ -22,31 +26,15 @@ use std::{
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use std::sync::atomic::{AtomicU64, Ordering};
-use log::{debug, error, info, warn};
-use inotify::{Inotify, WatchMask};
-use std::os::unix::fs::FileTypeExt;
-
 
 const BLOCK_SIZE: u32 = 4096;
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct Mapping {
+    // req - path relative to mount point
     path: String,
-    target: String,
-    permissions: Option<Permissions>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-struct Permissions {
-    owner: Option<u32>,
-    group: Option<u32>,
-    mode: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct FileMapping {
-    mappings: Vec<Mapping>,
+    // optional - if missing path is treated as deleted
+    target: Option<String>,
 }
 
 #[derive(Clone)]
@@ -112,11 +100,29 @@ impl PassthroughFS {
         ino
     }
 
+    // Updated logic for resolve_mapped_path:
+    // 1. If there's a mapping for the path and it has a target, return that.
+    // 2. If there's a mapping for the path with no target, return ENOENT (i.e. removed).
+    // 3. If no mapping, fallback to target_dir.
     fn resolve_mapped_path(&self, path: &str) -> io::Result<PathBuf> {
         let mappings = self.file_mapping.read().unwrap();
         if let Some(mapping) = mappings.get(path) {
-            Ok(PathBuf::from(&mapping.target))
+            if let Some(target) = &mapping.target {
+                let target_path = PathBuf::from(target);
+                let final_path = if target_path.is_absolute() {
+                    // Mapped to a specific target
+                    target_path
+                } else {
+                    // If it's not absolute, join with target_dir
+                    self.target_dir.join(target_path)
+                };
+                Ok(final_path)
+            } else {
+                // Mapping present but no target => treat as removed
+                Err(io::Error::new(io::ErrorKind::NotFound, "Path removed"))
+            }
         } else {
+            // No mapping => fallback to target_dir passthrough
             Ok(self.target_dir.join(path.trim_start_matches('/')))
         }
     }
@@ -146,11 +152,18 @@ impl PassthroughFS {
     }
 
     fn get_cached_attr(&self, ino: u64) -> Option<FileAttr> {
-        self.file_cache.read().unwrap().get(&ino).map(|c| c.attr.clone())
+        self.file_cache
+            .read()
+            .unwrap()
+            .get(&ino)
+            .map(|c| c.attr.clone())
     }
 
     fn set_cached_attr(&self, ino: u64, attr: FileAttr) {
-        self.file_cache.write().unwrap().insert(ino, CachedAttr { attr });
+        self.file_cache
+            .write()
+            .unwrap()
+            .insert(ino, CachedAttr { attr });
     }
 
     fn invalidate_attr(&self, ino: u64) {
@@ -163,7 +176,9 @@ impl PassthroughFS {
 
     fn read_target_metadata(&self, path: &Path) -> io::Result<FileAttr> {
         let metadata = fs::metadata(path)?;
-        let ino = self.get_ino_by_path(path).expect("Path should have ino after insert");
+        let ino = self
+            .get_ino_by_path(path)
+            .expect("Path should have ino after insert");
         Ok(self.to_file_attr(metadata, ino))
     }
 
@@ -180,7 +195,7 @@ fn read_exact_bytes<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool>
             Ok(0) => {
                 // EOF before reading all data
                 return Ok(false);
-            },
+            }
             Ok(n) => offset += n,
             Err(e) => return Err(e),
         }
@@ -193,7 +208,7 @@ fn read_exact_bytes<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool>
 /// - First 4 bytes: u32 length in big-endian
 /// - Next `length` bytes: JSON data
 fn read_length_prefixed_json<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
-    let mut length_buf = [0u8;4];
+    let mut length_buf = [0u8; 4];
     // Try to read length
     match read_exact_bytes(reader, &mut length_buf)? {
         true => {
@@ -203,7 +218,8 @@ fn read_length_prefixed_json<R: Read>(reader: &mut R) -> io::Result<Option<Strin
                 // EOF in the middle of payload
                 return Ok(None); // Indicate incomplete message
             }
-            let s = String::from_utf8(payload).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in JSON"))?;
+            let s = String::from_utf8(payload)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in JSON"))?;
             Ok(Some(s))
         }
         false => Ok(None), // no more data
@@ -222,7 +238,10 @@ fn reload_mappings(fs: &PassthroughFS) {
     let modified = match metadata.modified() {
         Ok(m) => m,
         Err(err) => {
-            warn!("Failed to get modification time for {}: {:?}", fs.mapping_file, err);
+            warn!(
+                "Failed to get modification time for {}: {:?}",
+                fs.mapping_file, err
+            );
             return;
         }
     };
@@ -260,33 +279,40 @@ fn reload_mappings(fs: &PassthroughFS) {
                 match serde_json::from_str::<HashMap<String, Mapping>>(&json_str) {
                     Ok(parsed) => Some(parsed),
                     Err(err) => {
-                        warn!("Failed to parse JSON from named pipe {}: {:?}", fs.mapping_file, err);
+                        warn!(
+                            "Failed to parse JSON from named pipe {}: {:?}",
+                            fs.mapping_file, err
+                        );
                         None
                     }
                 }
             }
             Ok(None) => {
                 // No data or incomplete message
-                warn!("No complete message available in named pipe {}", fs.mapping_file);
+                warn!(
+                    "No complete message available in named pipe {}",
+                    fs.mapping_file
+                );
                 None
             }
             Err(err) => {
-                warn!("Error reading from named pipe {}: {:?}", fs.mapping_file, err);
+                warn!(
+                    "Error reading from named pipe {}: {:?}",
+                    fs.mapping_file, err
+                );
                 None
             }
         }
     } else {
         // Regular file: read the entire file
         match fs::read_to_string(&fs.mapping_file) {
-            Ok(data) => {
-                match serde_json::from_str::<HashMap<String, Mapping>>(&data) {
-                    Ok(parsed) => Some(parsed),
-                    Err(err) => {
-                        warn!("Failed to parse JSON in {}: {:?}", fs.mapping_file, err);
-                        None
-                    }
+            Ok(data) => match serde_json::from_str::<HashMap<String, Mapping>>(&data) {
+                Ok(parsed) => Some(parsed),
+                Err(err) => {
+                    warn!("Failed to parse JSON in {}: {:?}", fs.mapping_file, err);
+                    None
                 }
-            }
+            },
             Err(err) => {
                 warn!("Failed to read {}: {:?}", fs.mapping_file, err);
                 None
@@ -304,7 +330,10 @@ fn reload_mappings(fs: &PassthroughFS) {
             let mut ls = fs.last_size.write().unwrap();
             *ls = Some(size);
         }
-        info!("Mappings successfully reloaded: {:?}", mappings.keys().collect::<Vec<_>>());
+        info!(
+            "Mappings successfully reloaded: {:?}",
+            mappings.keys().collect::<Vec<_>>()
+        );
         fs.invalidate_all_attrs();
     }
 }
@@ -333,7 +362,11 @@ fn start_mapping_monitor(fs: Arc<PassthroughFS>) {
                         inotify = Some(ino);
                     }
                     Err(err) => {
-                        warn!("Inotify watch failed for {}: {:?}", mapping_path.display(), err);
+                        warn!(
+                            "Inotify watch failed for {}: {:?}",
+                            mapping_path.display(),
+                            err
+                        );
                     }
                 }
             }
@@ -378,7 +411,10 @@ impl MyFS {
 impl Filesystem for MyFS {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let fs = &*self.fs;
-        fs.log_operation("lookup", &format!("parent ino: {}, name: {:?}", parent, name));
+        fs.log_operation(
+            "lookup",
+            &format!("parent ino: {}, name: {:?}", parent, name),
+        );
 
         let parent_path = if parent == 1 {
             PathBuf::from("/")
@@ -407,9 +443,9 @@ impl Filesystem for MyFS {
         match fs.resolve_mapped_path(&path_str) {
             Ok(full_path) => match fs::metadata(&full_path) {
                 Ok(metadata) => {
-                    let ino = fs.get_ino_by_path(&child_path).unwrap_or_else(|| {
-                        fs.insert_path(child_path.clone())
-                    });
+                    let ino = fs
+                        .get_ino_by_path(&child_path)
+                        .unwrap_or_else(|| fs.insert_path(child_path.clone()));
                     let attr = fs.to_file_attr(metadata, ino);
                     fs.set_cached_attr(ino, attr.clone());
                     reply.entry(&Duration::from_secs(0), &attr, 0);
@@ -458,7 +494,10 @@ impl Filesystem for MyFS {
         reply: ReplyData,
     ) {
         let fs = &*self.fs;
-        fs.log_operation("read", &format!("ino: {}, offset: {}, size: {}", ino, offset, size));
+        fs.log_operation(
+            "read",
+            &format!("ino: {}, offset: {}, size: {}", ino, offset, size),
+        );
 
         let path = match fs.get_path_by_ino(ino) {
             Some(p) => p,
@@ -497,7 +536,10 @@ impl Filesystem for MyFS {
         reply: ReplyWrite,
     ) {
         let fs = &*self.fs;
-        fs.log_operation("write", &format!("ino: {}, offset: {}, size: {}", ino, offset, data.len()));
+        fs.log_operation(
+            "write",
+            &format!("ino: {}, offset: {}, size: {}", ino, offset, data.len()),
+        );
 
         let path = match fs.get_path_by_ino(ino) {
             Some(p) => p,
@@ -508,18 +550,16 @@ impl Filesystem for MyFS {
         };
 
         match fs::OpenOptions::new().write(true).open(&path) {
-            Ok(file) => {
-                match file.write_at(data, offset as u64) {
-                    Ok(bytes_written) => {
-                        fs.invalidate_attr(ino);
-                        reply.written(bytes_written as u32);
-                    }
-                    Err(err) => {
-                        error!("Write operation failed: {}, Error: {}", path.display(), err);
-                        reply.error(libc::EIO);
-                    }
+            Ok(file) => match file.write_at(data, offset as u64) {
+                Ok(bytes_written) => {
+                    fs.invalidate_attr(ino);
+                    reply.written(bytes_written as u32);
                 }
-            }
+                Err(err) => {
+                    error!("Write operation failed: {}, Error: {}", path.display(), err);
+                    reply.error(libc::EIO);
+                }
+            },
             Err(_) => {
                 error!("File not found for writing: {}", path.display());
                 reply.error(libc::ENOENT);
@@ -542,7 +582,14 @@ impl Filesystem for MyFS {
         reply.ok();
     }
 
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
         let fs = &*self.fs;
         fs.log_operation("readdir", &format!("ino: {}", ino));
 
@@ -574,9 +621,9 @@ impl Filesystem for MyFS {
                         path.join(&name)
                     };
 
-                    let child_ino = fs.get_ino_by_path(&child_path).unwrap_or_else(|| {
-                        fs.insert_path(child_path)
-                    });
+                    let child_ino = fs
+                        .get_ino_by_path(&child_path)
+                        .unwrap_or_else(|| fs.insert_path(child_path));
                     let _ = reply.add(child_ino, (i + 1) as i64, file_type, &name);
                 }
             }
@@ -595,7 +642,10 @@ impl Filesystem for MyFS {
         reply: ReplyCreate,
     ) {
         let fs = &*self.fs;
-        fs.log_operation("create", &format!("parent: {}, name: {:?}, mode: {:o}", parent, name, mode));
+        fs.log_operation(
+            "create",
+            &format!("parent: {}, name: {:?}, mode: {:o}", parent, name, mode),
+        );
 
         let parent_path = if parent == 1 {
             PathBuf::from("/")
@@ -615,11 +665,16 @@ impl Filesystem for MyFS {
             parent_path.join(name)
         };
 
-        match OpenOptions::new().write(true).create(true).mode(mode).open(&full_path) {
+        match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .mode(mode)
+            .open(&full_path)
+        {
             Ok(_) => {
-                let ino = fs.get_ino_by_path(&full_path).unwrap_or_else(|| {
-                    fs.insert_path(full_path.clone())
-                });
+                let ino = fs
+                    .get_ino_by_path(&full_path)
+                    .unwrap_or_else(|| fs.insert_path(full_path.clone()));
 
                 match fs::metadata(&full_path) {
                     Ok(metadata) => {
@@ -628,13 +683,21 @@ impl Filesystem for MyFS {
                         reply.created(&Duration::from_secs(0), &attr, 0, 0, 0);
                     }
                     Err(err) => {
-                        error!("Failed to retrieve metadata for created file: {}, Error: {}", full_path.display(), err);
+                        error!(
+                            "Failed to retrieve metadata for created file: {}, Error: {}",
+                            full_path.display(),
+                            err
+                        );
                         reply.error(libc::EIO);
                     }
                 }
             }
             Err(err) => {
-                error!("Failed to create file: {}, Error: {}", full_path.display(), err);
+                error!(
+                    "Failed to create file: {}, Error: {}",
+                    full_path.display(),
+                    err
+                );
                 reply.error(libc::EIO);
             }
         }
@@ -662,7 +725,7 @@ fn main() {
         )
         .arg(
             Arg::new("mapping_file")
-                .help("The JSON file containing mappings (can be a named pipe or regular file)")
+                .help("The JSON file (or named pipe) containing mappings. Missing 'target' means removed.")
                 .required(false)
                 .default_value("filemapping.json")
                 .value_parser(clap::value_parser!(String)),
@@ -673,7 +736,10 @@ fn main() {
     let target = matches.get_one::<String>("target").unwrap();
     let mapping_file = matches.get_one::<String>("mapping_file").unwrap();
 
-    let fs = Arc::new(PassthroughFS::new(PathBuf::from(target), mapping_file.clone()));
+    let fs = Arc::new(PassthroughFS::new(
+        PathBuf::from(target),
+        mapping_file.clone(),
+    ));
 
     start_mapping_monitor(fs.clone());
     reload_mappings(&fs);
@@ -685,8 +751,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::env;
+    use std::fs;
 
     fn create_temp_dir_for_test(test_name: &str) -> PathBuf {
         let base = env::temp_dir();
@@ -728,7 +794,34 @@ mod tests {
         assert_eq!(cached.ino, attr.ino);
 
         fs.invalidate_attr(ino);
-        assert!(fs.get_cached_attr(ino).is_none(), "Attribute should be invalidated");
+        assert!(
+            fs.get_cached_attr(ino).is_none(),
+            "Attribute should be invalidated"
+        );
+    }
+
+    #[test]
+    fn test_invalidate_all_attrs() {
+        let temp_dir = create_temp_dir_for_test("test_invalidate_all_attrs");
+        let fs = PassthroughFS::new(temp_dir.clone(), "mapping.json".to_string());
+
+        let file_path = temp_dir.join("testfile2");
+        fs::write(&file_path, b"Hello").unwrap();
+        let ino = fs.insert_path(file_path.clone());
+        let metadata = fs::metadata(&file_path).unwrap();
+        let attr = fs.to_file_attr(metadata, ino);
+
+        fs.set_cached_attr(ino, attr.clone());
+        assert!(
+            fs.get_cached_attr(ino).is_some(),
+            "Attribute should be cached"
+        );
+
+        fs.invalidate_all_attrs();
+        assert!(
+            fs.get_cached_attr(ino).is_none(),
+            "All attributes should be invalidated"
+        );
     }
 
     #[test]
@@ -771,7 +864,8 @@ mod tests {
 
     #[test]
     fn test_resolve_mapped_path_with_and_without_mapping() {
-        let temp_dir = create_temp_dir_for_test("test_resolve_mapped_path_with_and_without_mapping");
+        let temp_dir =
+            create_temp_dir_for_test("test_resolve_mapped_path_with_and_without_mapping");
         let mapping_file = temp_dir.join("filemapping.json");
 
         let mappings = r#"
@@ -790,32 +884,69 @@ mod tests {
 
         {
             let loaded = fs.file_mapping.read().unwrap();
-            assert!(loaded.contains_key("/mapped_file"), "Should have loaded /mapped_file mapping");
+            assert!(
+                loaded.contains_key("/mapped_file"),
+                "Should have loaded /mapped_file mapping"
+            );
         }
 
         let resolved = fs.resolve_mapped_path("/mapped_file").unwrap();
-        assert_eq!(resolved, PathBuf::from("/real_target/mapped_file"), "Should resolve to mapped target");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/real_target/mapped_file"),
+            "Should resolve to mapped target"
+        );
 
         let resolved = fs.resolve_mapped_path("/no_such_mapping").unwrap();
         let expected = temp_dir.join("no_such_mapping");
-        assert_eq!(resolved, expected, "Fallback to target_dir for unmapped paths");
+        assert_eq!(
+            resolved, expected,
+            "Fallback to target_dir for unmapped paths"
+        );
     }
 
     #[test]
-    fn test_invalidate_all_attrs() {
-        let temp_dir = create_temp_dir_for_test("test_invalidate_all_attrs");
-        let fs = PassthroughFS::new(temp_dir.clone(), "mapping.json".to_string());
+    fn test_no_target_means_removed() {
+        let temp_dir = create_temp_dir_for_test("test_no_target_means_removed");
+        let mapping_file = temp_dir.join("filemapping.json");
+        let underlying_file = temp_dir.join("realfile.txt");
+        fs::write(&underlying_file, "Hello").unwrap();
 
-        let file_path = temp_dir.join("testfile2");
-        fs::write(&file_path, b"Hello").unwrap();
-        let ino = fs.insert_path(file_path.clone());
-        let metadata = fs::metadata(&file_path).unwrap();
-        let attr = fs.to_file_attr(metadata, ino);
+        // Create a mapping where:
+        // - "/removed_path" has no 'target' => should be treated as removed
+        // - "/existing_path" has a 'target' => should map to underlying_file
+        let mappings = r#"
+    {
+        "/removed_path": {
+            "path": "/removed_path"
+        },
+        "/existing_path": {
+            "path": "/existing_path",
+            "target": "realfile.txt"
+        }
+    }
+    "#;
+        fs::write(&mapping_file, mappings).unwrap();
 
-        fs.set_cached_attr(ino, attr.clone());
-        assert!(fs.get_cached_attr(ino).is_some(), "Attribute should be cached");
+        let fs = PassthroughFS::new(temp_dir.clone(), mapping_file.to_string_lossy().to_string());
+        reload_mappings(&fs);
 
-        fs.invalidate_all_attrs();
-        assert!(fs.get_cached_attr(ino).is_none(), "All attributes should be invalidated");
+        // "/existing_path" should map successfully to underlying_file
+        let resolved = fs.resolve_mapped_path("/existing_path");
+        assert!(resolved.is_ok(), "existing_path should resolve to a file");
+        assert_eq!(resolved.unwrap(), temp_dir.join("realfile.txt"));
+
+        // "/removed_path" should return ENOENT since 'target' is absent
+        let removed = fs.resolve_mapped_path("/removed_path");
+        assert!(
+            removed.is_err(),
+            "removed_path should be treated as removed"
+        );
+        let err = removed.err().unwrap();
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "Should return NotFound error for removed_path"
+        );
     }
 }

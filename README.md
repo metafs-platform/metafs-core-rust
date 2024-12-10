@@ -41,37 +41,44 @@ PassthroughFS is a FUSE-based filesystem written in Rust that allows users to mo
 ## Configuration
 PassthroughFS uses a JSON configuration file to define mappings. Below is an example configuration (filemapping.json):
    ```json
-    {
-      "mappings": [
-        {
-          "path": "/example.txt",
-          "target": "/real/target/example.txt",
-          "permissions": {
-            "owner": 1000,
-            "group": 1000,
-            "mode": 420
-          }
-        },
-        {
-          "path": "/readonly.txt",
-          "target": "/real/target/readonly.txt",
-          "permissions": {
-            "owner": 1000,
-            "group": 1000,
-            "mode": 292
-          }
-        },
-        {
-          "path": "/unrestricted-folder",
-          "target": "/real/target/unrestricted-folder"
-        }
-      ]
-    }
-```
+   {
+     "/example.txt": {
+       "path": "/example.txt",
+       "target": "/underlying_fs/real_example.txt"
+     },
+     "/example2.txt": {
+       "path": "/example2.txt"
+     },
+     "/some/dir": {
+       "path": "/some/dir",
+       "target": "/underlying_fs/some/dir"
+     }
+   }
+   ```
 ### Fields
 * `path`: The virtual path in the mounted filesystem.
 * `target`: The corresponding actual path in the target directory.
-* `permissions`: (Optional) Custom permissions for the virtual file.
+
+If an entry contains the 'path' field (required) but not the target field (optional), that is treated as if the target 
+path has been removed (aka, deleted).
+
+If the target is an absolute path, then that path is used as-is. If the target is a relative path, then that path is
+converted to an absolute path by appending it to the path passed in as the `--target` param when starting the fs.  
+
+### Regular file mode vs named pipe mode
+PassthroughFS operates in a different mode when the passed filemapping.json file is a named pipe.
+
+For regular mode, the entire file is processed in one chunk. This is triggered when an inotify event is sent, or as a 
+fallback, polled for date and size changes every 100ms. Care must be taken to not write to this file when the fs is 
+reading it, which means an approach based on an atomic renames or similar will be needed by the writing process. This 
+mode is most useful for simple static mappings, perhaps exported from a more dynamic system, and allows the fs to 
+operate without a server.
+
+For named pipe mode, a 'protocol' of sorts is implemented by the called expecting a 4-byte length value, which is to be
+calculated by the sender, and will trigger the fs to read that many bytes, in however many chunked reads it takes, 
+before applying that as the update. After the 4-byte length is pushed, the contents of the file is the same is in the 
+regular mode, i.e., a json payload with the structure as documented in the example above. 
+
 
 ## Usage
 1. Create a directory for the mount point:
@@ -120,8 +127,6 @@ Contributions are welcome! To contribute:
 This project is licensed under the following terms:
 1. Apache License, Version 2.0
 2. GNU General Public License, Version 3
-
-Please Note: If you choose to use this software under the Apache License, Version 2.0, and any provision of that license is determined to be invalid or unenforceable in a jurisdiction (including but not limited to the patent clause), this software will instead be licensed under the terms of the GNU General Public License, Version 3 or later, for that jurisdiction.
 
 ## Acknowledgments
 * FUSE: Foundation for the filesystem integration.
