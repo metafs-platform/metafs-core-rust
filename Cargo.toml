@@ -1,0 +1,15 @@
+[package]
+name = "metafs-core-rust"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = "4.5.23"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+libc = "0.2.168"
+fuser = "0.15.1"
+nix = "0.29.0"
+log = "0.4.22"
