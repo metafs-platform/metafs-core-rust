@@ -13,13 +13,12 @@ use fuser::{
 use inotify::{Inotify, WatchMask};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::FileTypeExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     ffi::OsStr,
     fs::{self, OpenOptions},
-    io::{self, Read},
+    io::{self},
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -31,9 +30,7 @@ const BLOCK_SIZE: u32 = 4096;
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 struct Mapping {
-    // req - path relative to mount point
     path: String,
-    // optional - if missing path is treated as deleted
     target: Option<String>,
 }
 
@@ -187,45 +184,6 @@ impl PassthroughFS {
     }
 }
 
-/// Read exactly `buf.len()` bytes from `reader`. Returns Ok(true) if successful, Ok(false) if EOF is reached early, Err otherwise.
-fn read_exact_bytes<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool> {
-    let mut offset = 0;
-    while offset < buf.len() {
-        match reader.read(&mut buf[offset..]) {
-            Ok(0) => {
-                // EOF before reading all data
-                return Ok(false);
-            }
-            Ok(n) => offset += n,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(true)
-}
-
-/// Reads a length-prefixed JSON message from `reader`.
-/// Format:
-/// - First 4 bytes: u32 length in big-endian
-/// - Next `length` bytes: JSON data
-fn read_length_prefixed_json<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
-    let mut length_buf = [0u8; 4];
-    // Try to read length
-    match read_exact_bytes(reader, &mut length_buf)? {
-        true => {
-            let length = u32::from_be_bytes(length_buf) as usize;
-            let mut payload = vec![0; length];
-            if !read_exact_bytes(reader, &mut payload)? {
-                // EOF in the middle of payload
-                return Ok(None); // Indicate incomplete message
-            }
-            let s = String::from_utf8(payload)
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8 in JSON"))?;
-            Ok(Some(s))
-        }
-        false => Ok(None), // no more data
-    }
-}
-
 fn reload_mappings(fs: &PassthroughFS) {
     let metadata = match fs::metadata(&fs.mapping_file) {
         Ok(m) => m,
@@ -259,64 +217,17 @@ fn reload_mappings(fs: &PassthroughFS) {
 
     info!("Reloading mappings from {}", fs.mapping_file);
 
-    // Determine if it's a named pipe or a regular file
-    let file_type = metadata.file_type();
-    let is_fifo = file_type.is_fifo(); // On Unix, named pipes can be checked with is_fifo()
-
-    let result: Option<HashMap<String, Mapping>> = if is_fifo {
-        // Named pipe: use length-prefixed reading
-        let mut fifo = match OpenOptions::new().read(true).open(&fs.mapping_file) {
-            Ok(f) => f,
+    let result: Option<HashMap<String, Mapping>> = match fs::read_to_string(&fs.mapping_file) {
+        Ok(data) => match serde_json::from_str::<HashMap<String, Mapping>>(&data) {
+            Ok(parsed) => Some(parsed),
             Err(err) => {
-                warn!("Failed to open named pipe {}: {:?}", fs.mapping_file, err);
-                return;
-            }
-        };
-
-        // Attempt to read one complete message
-        match read_length_prefixed_json(&mut fifo) {
-            Ok(Some(json_str)) => {
-                match serde_json::from_str::<HashMap<String, Mapping>>(&json_str) {
-                    Ok(parsed) => Some(parsed),
-                    Err(err) => {
-                        warn!(
-                            "Failed to parse JSON from named pipe {}: {:?}",
-                            fs.mapping_file, err
-                        );
-                        None
-                    }
-                }
-            }
-            Ok(None) => {
-                // No data or incomplete message
-                warn!(
-                    "No complete message available in named pipe {}",
-                    fs.mapping_file
-                );
+                warn!("Failed to parse JSON in {}: {:?}", fs.mapping_file, err);
                 None
             }
-            Err(err) => {
-                warn!(
-                    "Error reading from named pipe {}: {:?}",
-                    fs.mapping_file, err
-                );
-                None
-            }
-        }
-    } else {
-        // Regular file: read the entire file
-        match fs::read_to_string(&fs.mapping_file) {
-            Ok(data) => match serde_json::from_str::<HashMap<String, Mapping>>(&data) {
-                Ok(parsed) => Some(parsed),
-                Err(err) => {
-                    warn!("Failed to parse JSON in {}: {:?}", fs.mapping_file, err);
-                    None
-                }
-            },
-            Err(err) => {
-                warn!("Failed to read {}: {:?}", fs.mapping_file, err);
-                None
-            }
+        },
+        Err(err) => {
+            warn!("Failed to read {}: {:?}", fs.mapping_file, err);
+            None
         }
     };
 
@@ -549,7 +460,7 @@ impl Filesystem for MyFS {
             }
         };
 
-        match fs::OpenOptions::new().write(true).open(&path) {
+        match OpenOptions::new().write(true).open(&path) {
             Ok(file) => match file.write_at(data, offset as u64) {
                 Ok(bytes_written) => {
                     fs.invalidate_attr(ino);
@@ -707,13 +618,13 @@ impl Filesystem for MyFS {
 fn main() {
     env_logger::init();
 
-    let matches = Command::new("PassthroughFS")
+    let matches = Command::new("PassthroughMVPFS")
         .version("1.0")
         .author("Nos Doughty <cetic.nos@gmail.com>")
-        .about("A FUSE-based passthrough filesystem with JSON-based mappings")
+        .about("A FUSE-based MVP passthrough filesystem with JSON-based mappings")
         .arg(
             Arg::new("mountpoint")
-                .help("The directory where the FUSE filesystem will be mounted")
+                .help("Directory where the FUSE filesystem will be mounted")
                 .required(true)
                 .value_parser(clap::value_parser!(String)),
         )
@@ -725,7 +636,7 @@ fn main() {
         )
         .arg(
             Arg::new("mapping_file")
-                .help("The JSON file (or named pipe) containing mappings. Missing 'target' means removed.")
+                .help("The JSON file containing mappings")
                 .required(false)
                 .default_value("filemapping.json")
                 .value_parser(clap::value_parser!(String)),
@@ -843,13 +754,11 @@ mod tests {
         {
             "/foo": {
                 "path": "/foo",
-                "target": "/real_target/foo",
-                "permissions": null
+                "target": "/real_target/foo"
             },
             "/bar": {
                 "path": "/bar",
-                "target": "/real_target/bar",
-                "permissions": null
+                "target": "/real_target/bar"
             }
         }
         "#;
@@ -872,8 +781,7 @@ mod tests {
         {
             "/mapped_file": {
                 "path": "/mapped_file",
-                "target": "/real_target/mapped_file",
-                "permissions": null
+                "target": "/real_target/mapped_file"
             }
         }
         "#;
