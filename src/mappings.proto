@@ -1,77 +1,57 @@
 syntax = "proto3";
 
 message MappingMessage {
-  int32 version = 1;
-  int64 timestamp = 2;              // Unix timestamp
+  int32 version = 1;                // if missing default to 1
+  int64 timestamp = 2;              // Unix timestamp, if missing default to now
   oneof message_body {
-    Version1Body v1 = 3;
+    Version1Body v1 = 3;            // if missing, treat as ping and send beck version
   }
 }
 
 message Version1Body {
-  string message_id = 1;            // a uuid, optional, used to match replies to requests
-  repeated Mapping mappings = 2;    // List of mappings
+  string correlation_id = 1;        // uuid to match replies to requests, if missing leave empty
+  repeated Mapping mappings = 2;    // List of mappings. If missing (ping) send current timestamp and same correlation (if present).
 }
 
 message Mapping {
   string path = 1;              // Key (e.g., "/example/path")
   string target = 2;            // Value (e.g., "/real/target/path"), optional for REMOVE
-  string notify_pipe = 3;       // Optional pipe to notify when calling this path - passes path and target
-  bool delete = 4;             // Optional, default false
+  string opaque = 3;            // Optional, if present, send with the message to the pipe when the mapping is hit
+  bool delete = 4;              // Optional, default false
 }
 
 /*
-
-There are 4 fields:
+Inside a mapping there are 4 fields:
   1. path
   2. target
   3. notify_pipe
   4. delete
+
+In the table below, o means missing from the message payload, x means present.
+
  
-All are optional, but if none are provided, then the message is a clear queue. 
-Works as safety value also for broken message sends. Any other combination of
-fields has specific meaning, as outlined below:
-
-Path|Target|Pipe|Delete|Result:
+Path|Target|Delete|Result:
 --------------------------------
-  o  |  o   |  o  |  o   |  recovery mode (*1)
-  o  |  o   |  o  |  x   |  deleted mapping for (default) path
-  o  |  o   |  x  |  o   |  created mapping at mount point for (default)path->pipe (shortcut)
-  o  |  o   |  x  |  x   |  deleted mapping at mount point for (default)path->pipe (shortcut)
-  o  |  x   |  o  |  o   |  created mapping at mount point for (default)path->target (shortcut)
-  o  |  x   |  o  |  x   |  deleted mapping at mount point for (default)path->target (shortcut)
-  o  |  x   |  x  |  o   |  created mapping at mount point for (default)path+target->pipe (shortcut)
-  o  |  x   |  x  |  x   |  deleted mapping at mount point for (default)path+target->pipe (shortcut)
-  x  |  o   |  o  |  o   |  remove mapping of path from system (*1)
-  x   |  o  |  o  |  x   |  deleted mapping for path
-  x   |  o  |  x  |  o   |  created mapping at mount point for path->pipe
-  x   |  o  |  x  |  x   |  deleted mapping if pipe same at mount point for path->pipe
-  x   |  x   |  o  |  o  |  created mapping at mount point for path->target
-  x   |  x   |  o  |  x  |  deleted mapping at mount point for path->target
-  x   |  x   |  x  |  o  |  created mapping at mount point for path+target->pipe
-  x   |  x   |  x  |  x  |  deleted mapping at mount point for path+target->pipe
+  o  |  o   |  o   |  clear all mappings
+  o  |  o   |  x   |  deleted mapping for (default) path
+  o  |  x   |  x   |  deleted mapping at mount point for (default)path->target (shortcut)
+  o  |  x   |  o   |  created mapping at mount point for (default)path->target (shortcut)
+  x  |  o   |  o   |  remove the mapping for the path
+  x   |  o  |  x   |  deleted mapping for path
+  x   |  x  |  o  |   created mapping at mount point for path->target
+  x   |  x  |  x  |   deleted mapping at mount point for path->target
 
-System Messages:
-(*1) Reset Mappings: Clear all mappings everything and send reset to bridge for refreshed mappings.
-(*2) Remove Mapping: Remove the mapping for the path.
-
-
-Sending Messages To Pipes:
+Sending Messages To the Send Pipe:
 
 For MAX simplicity:
-  1. When rending a request, have to send params as protobuf message.
-  2. The return value has to also be a protobuf message.
+  1. When sending a request, send params as protobuf message.
+  2. The return value has to also be a separate protobuf message.
   3. In other words, we are protobuffing the signatures of the methods.
-  4. When sending a message we send a unique messageid, 
-    a. and we block until we get a response
-    b. if we get a response with the same messageid, we know it's the correct response
-    c. if we get a response with a different messageid, we know to keep waiting.
-    d. when a timeout occurs, we send another reset with the same messageid and wait for a response.
-    e. if the server is still working, we know because the same messageid, then we just ignore the reset.
+  4. When sending a message we send a unique correlationid, 
+    a. and we block until we get a response with the same correlationid, processing others but keeping blocked.
+    d. when a timeout occurs, we send another request with the same correlationid and wait for a response.
+    e. if the server is still working, we know because the same correlationid, then we will just ignore the reset.
     f. the bridge retries until it gets a response. After max timeout, it gives up and deletes mapping for path.
   5. each request is singular (not batched), but in its own thread.    
-  
-
-
 
  */
