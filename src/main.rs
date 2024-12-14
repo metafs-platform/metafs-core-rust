@@ -9,10 +9,12 @@ use clap::{Arg, Command};
 use fs::Metadata;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyWrite, Request,
+    ReplyEntry, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashMap,
@@ -97,8 +99,16 @@ impl PassthroughFS {
         ino
     }
 
+    fn get_parent_path(&self, parent: u64) -> Option<PathBuf> {
+        if parent == 1 {
+            Some(PathBuf::from("/"))
+        } else {
+            self.get_path_by_ino(parent)
+        }
+    }
+
     // Updated logic for resolve_mapped_path:
-    // 1. If there's a mapping for the path and it has a target, return that.
+    // 1. If there's a mapping for the path, and it has a target, return that.
     // 2. If there's a mapping for the path with no target, return ENOENT (i.e. removed).
     // 3. If no mapping, fallback to target_dir.
     fn resolve_mapped_path(&self, path: &str) -> io::Result<PathBuf> {
@@ -316,15 +326,11 @@ impl Filesystem for MyFS {
             &format!("parent ino: {}, name: {:?}", parent, name),
         );
 
-        let parent_path = if parent == 1 {
-            PathBuf::from("/")
-        } else {
-            match fs.get_path_by_ino(parent) {
-                Some(p) => p,
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let parent_path = match fs.get_parent_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -547,15 +553,11 @@ impl Filesystem for MyFS {
             &format!("parent: {}, name: {:?}, mode: {:o}", parent, name, mode),
         );
 
-        let parent_path = if parent == 1 {
-            PathBuf::from("/")
-        } else {
-            match fs.get_path_by_ino(parent) {
-                Some(p) => p,
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+        let parent_path = match fs.get_parent_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
             }
         };
 
@@ -598,6 +600,497 @@ impl Filesystem for MyFS {
                     full_path.display(),
                     err
                 );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn mkdir(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let fs = &*self.fs;
+        fs.log_operation(
+            "mkdir",
+            &format!("parent: {}, name: {:?}, mode: {:o}", parent, name, mode),
+        );
+
+        let parent_path = match fs.get_parent_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let full_path = if parent_path == PathBuf::from("/") {
+            PathBuf::from("/").join(name)
+        } else {
+            parent_path.join(name)
+        };
+
+        match fs::create_dir(&full_path) {
+            Ok(()) => {
+                let ino = fs
+                    .get_ino_by_path(&full_path)
+                    .unwrap_or_else(|| fs.insert_path(full_path.clone()));
+
+                match fs::metadata(&full_path) {
+                    Ok(metadata) => {
+                        let attr = fs.to_file_attr(metadata, ino);
+                        fs.set_cached_attr(ino, attr.clone());
+                        reply.entry(&Duration::from_secs(0), &attr, 0);
+                    }
+                    Err(err) => {
+                        error!(
+                            "Failed to get metadata for created directory: {}, Error: {}",
+                            full_path.display(),
+                            err
+                        );
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Failed to create directory: {}, Error: {}",
+                    full_path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let fs = &*self.fs;
+        fs.log_operation("unlink", &format!("parent: {}, name: {:?}", parent, name));
+
+        let parent_path = match fs.get_parent_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let full_path = parent_path.join(name);
+        match fs::remove_file(&full_path) {
+            Ok(()) => reply.ok(),
+            Err(err) => {
+                error!(
+                    "Failed to remove file: {}, Error: {}",
+                    full_path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let fs = &*self.fs;
+        fs.log_operation("rmdir", &format!("parent: {}, name: {:?}", parent, name));
+
+        let parent_path = match fs.get_parent_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let full_path = parent_path.join(name);
+        match fs::remove_dir(&full_path) {
+            Ok(()) => reply.ok(),
+            Err(err) => {
+                error!(
+                    "Failed to remove directory: {}, Error: {}",
+                    full_path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let fs = &*self.fs;
+        fs.log_operation(
+            "rename",
+            &format!(
+                "parent: {}, name: {:?}, newparent: {}, newname: {:?}",
+                parent, name, newparent, newname
+            ),
+        );
+
+        let parent_path = match fs.get_parent_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let new_parent_path = match fs.get_parent_path(newparent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let old_path = parent_path.join(name);
+        let new_path = new_parent_path.join(newname);
+
+        match fs::rename(&old_path, &new_path) {
+            Ok(()) => {
+                // Update inode mappings
+                if let Some(ino) = fs.get_ino_by_path(&old_path) {
+                    let mut ino_map = fs.ino_to_path.write().unwrap();
+                    let mut path_map = fs.path_to_ino.write().unwrap();
+                    ino_map.insert(ino, new_path.clone());
+                    path_map.remove(&old_path);
+                    path_map.insert(new_path, ino);
+                }
+                reply.ok();
+            }
+            Err(err) => {
+                error!(
+                    "Failed to rename {} to {}, Error: {}",
+                    old_path.display(),
+                    new_path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let fs = &*self.fs;
+        fs.log_operation("setattr", &format!("ino: {}", ino));
+
+        let path = match fs.get_path_by_ino(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        // Handle mode change (chmod)
+        if let Some(mode) = mode {
+            if let Err(err) = fs::set_permissions(&path, fs::Permissions::from_mode(mode)) {
+                error!("Failed to chmod {}, Error: {}", path.display(), err);
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        // Handle ownership change (chown)
+        if uid.is_some() || gid.is_some() {
+            unsafe {
+                let res = libc::chown(
+                    path.as_os_str().as_bytes().as_ptr() as *const i8,
+                    uid.unwrap_or(u32::MAX),
+                    gid.unwrap_or(u32::MAX),
+                );
+                if res != 0 {
+                    error!(
+                        "Failed to chown {}, Error: {}",
+                        path.display(),
+                        io::Error::last_os_error()
+                    );
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+        }
+
+        // Handle size change (truncate)
+        if let Some(size) = size {
+            if let Err(err) = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(size))
+            {
+                error!("Failed to truncate {}, Error: {}", path.display(), err);
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        // Return updated attributes
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                let attr = fs.to_file_attr(metadata, ino);
+                fs.set_cached_attr(ino, attr.clone());
+                reply.attr(&Duration::from_secs(0), &attr);
+            }
+            Err(err) => {
+                error!("Failed to get metadata {}, Error: {}", path.display(), err);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        link: &Path,
+        reply: ReplyEntry,
+    ) {
+        let fs = &*self.fs;
+        fs.log_operation(
+            "symlink",
+            &format!("parent: {}, name: {:?}, link: {:?}", parent, name, link),
+        );
+
+        let parent_path = if parent == 1 {
+            PathBuf::from("/")
+        } else {
+            match fs.get_path_by_ino(parent) {
+                Some(p) => p,
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        };
+
+        let full_path = parent_path.join(name);
+        match std::os::unix::fs::symlink(link, &full_path) {
+            Ok(()) => {
+                let ino = fs
+                    .get_ino_by_path(&full_path)
+                    .unwrap_or_else(|| fs.insert_path(full_path.clone()));
+
+                match fs::metadata(&full_path) {
+                    Ok(metadata) => {
+                        let attr = fs.to_file_attr(metadata, ino);
+                        fs.set_cached_attr(ino, attr.clone());
+                        reply.entry(&Duration::from_secs(0), &attr, 0);
+                    }
+                    Err(err) => {
+                        error!(
+                            "Failed to get metadata for symlink: {}, Error: {}",
+                            full_path.display(),
+                            err
+                        );
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Failed to create symlink: {}, Error: {}",
+                    full_path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
+        let fs = &*self.fs;
+        fs.log_operation("readlink", &format!("ino: {}", ino));
+
+        let path = match fs.get_path_by_ino(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match fs::read_link(&path) {
+            Ok(target) => reply.data(target.as_os_str().as_bytes()),
+            Err(err) => {
+                error!("Failed to read symlink: {}, Error: {}", path.display(), err);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn fsync(&mut self, _req: &Request, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
+        let fs = &*self.fs;
+        fs.log_operation("fsync", &format!("ino: {}, datasync: {}", ino, datasync));
+
+        let path = match fs.get_path_by_ino(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => {
+                if datasync {
+                    match file.sync_data() {
+                        Ok(()) => reply.ok(),
+                        Err(err) => {
+                            error!("Failed to sync data for {}, Error: {}", path.display(), err);
+                            reply.error(libc::EIO);
+                        }
+                    }
+                } else {
+                    match file.sync_all() {
+                        Ok(()) => reply.ok(),
+                        Err(err) => {
+                            error!("Failed to sync all for {}, Error: {}", path.display(), err);
+                            reply.error(libc::EIO);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Failed to open file for fsync {}, Error: {}",
+                    path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn fsyncdir(&mut self, _req: &Request, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
+        let fs = &*self.fs;
+        fs.log_operation("fsyncdir", &format!("ino: {}, datasync: {}", ino, datasync));
+
+        let path = match fs.get_path_by_ino(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match fs::File::open(&path) {
+            Ok(file) => {
+                if datasync {
+                    match file.sync_data() {
+                        Ok(()) => reply.ok(),
+                        Err(err) => {
+                            error!(
+                                "Failed to sync dir data for {}, Error: {}",
+                                path.display(),
+                                err
+                            );
+                            reply.error(libc::EIO);
+                        }
+                    }
+                } else {
+                    match file.sync_all() {
+                        Ok(()) => reply.ok(),
+                        Err(err) => {
+                            error!(
+                                "Failed to sync dir all for {}, Error: {}",
+                                path.display(),
+                                err
+                            );
+                            reply.error(libc::EIO);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Failed to open dir for fsync {}, Error: {}",
+                    path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn flush(&mut self, _req: &Request, ino: u64, _fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
+        let fs = &*self.fs;
+        fs.log_operation("flush", &format!("ino: {}", ino));
+
+        let path = match fs.get_path_by_ino(ino) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => match file.sync_all() {
+                Ok(()) => reply.ok(),
+                Err(err) => {
+                    error!("Failed to flush {}, Error: {}", path.display(), err);
+                    reply.error(libc::EIO);
+                }
+            },
+            Err(err) => {
+                error!(
+                    "Failed to open file for flush {}, Error: {}",
+                    path.display(),
+                    err
+                );
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        let fs = &*self.fs;
+        fs.log_operation("statfs", "querying filesystem statistics");
+
+        match nix::sys::statfs::statfs(&fs.target_dir) {
+            Ok(stat) => {
+                reply.statfs(
+                    stat.blocks(),            // Total blocks
+                    stat.blocks_free(),       // Free blocks
+                    stat.blocks_available(),  // Available blocks
+                    stat.files(),             // Total inodes
+                    stat.files_free(),        // Free inodes
+                    stat.block_size() as u32, // Block size
+                    256,                      // Maximum name length (common value)
+                    stat.block_size() as u32, // Fragment size
+                );
+            }
+            Err(err) => {
+                error!("Failed to get filesystem statistics: {}", err);
                 reply.error(libc::EIO);
             }
         }
@@ -665,11 +1158,23 @@ mod tests {
         temp_dir
     }
 
+    // Add to your existing test setup functions
+    fn create_test_file(dir: &Path, name: &str, contents: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn create_test_dir(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::create_dir(&path).unwrap();
+        path
+    }
+
     // Integration test for named pipe:
     // 1. Create a named pipe using `mkfifo`.
     // 2. Write a length-prefixed JSON payload to the pipe.
     // 3. Call reload_mappings and verify the mappings are loaded.
-
     #[test]
     fn test_reload_mappings_from_pipe() {
         let temp_dir = create_temp_dir_for_test("test_reload_mappings_from_pipe");
@@ -715,7 +1220,7 @@ mod tests {
             thread::spawn(move || {
                 // Open in write mode after some delay to ensure the main thread tries to read
                 thread::sleep(Duration::from_millis(100));
-                let mut file = fs::OpenOptions::new()
+                let mut file = OpenOptions::new()
                     .write(true)
                     .open(pipe_path_clone)
                     .expect("Failed to open pipe for writing");
@@ -790,5 +1295,240 @@ mod tests {
 
         fs.invalidate_all_attrs();
         assert!(fs.get_cached_attr(ino).is_none());
+    }
+
+    #[test]
+    fn test_mkdir_and_rmdir() {
+        let temp_dir = create_temp_dir_for_test("test_mkdir_rmdir");
+        let fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+        let dir_path = temp_dir.join("testdir");
+        let _dir_ino = fs.insert_path(dir_path.clone());
+
+        // Test directory creation
+        fs::create_dir(&dir_path).unwrap();
+        let metadata = fs::metadata(&dir_path).unwrap();
+        assert!(metadata.is_dir());
+
+        // Test directory removal
+        fs::remove_dir(&dir_path).unwrap();
+        assert!(!dir_path.exists());
+    }
+
+    #[test]
+    fn test_rename_operations() {
+        let temp_dir = create_temp_dir_for_test("test_rename");
+        let fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+        let old_path = create_test_file(&temp_dir, "old.txt", b"test");
+        let new_path = temp_dir.join("new.txt");
+
+        let _old_ino = fs.insert_path(old_path.clone());
+        fs::rename(&old_path, &new_path).unwrap();
+
+        assert!(!old_path.exists());
+        assert!(new_path.exists());
+        assert_eq!(fs::read(&new_path).unwrap(), b"test");
+    }
+
+    #[test]
+    fn test_chmod_and_chown() {
+        let temp_dir = create_temp_dir_for_test("test_permissions");
+        let fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+        let file_path = create_test_file(&temp_dir, "test.txt", b"test");
+        let _ino = fs.insert_path(file_path.clone());
+
+        // Test chmod
+        fs::set_permissions(&file_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let metadata = fs::metadata(&file_path).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o644);
+    }
+
+    #[test]
+    fn test_symlink_operations() {
+        let temp_dir = create_temp_dir_for_test("test_symlink");
+        let _fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+        let target_path = create_test_file(&temp_dir, "target.txt", b"test");
+        let link_path = temp_dir.join("link.txt");
+
+        std::os::unix::fs::symlink(&target_path, &link_path).unwrap();
+        assert!(link_path.exists());
+
+        let link_target = fs::read_link(&link_path).unwrap();
+        assert_eq!(link_target, target_path);
+    }
+
+    #[test]
+    fn test_truncate() {
+        let temp_dir = create_temp_dir_for_test("test_truncate");
+        let fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+        let file_path = create_test_file(&temp_dir, "test.txt", b"hello world");
+        let _ino = fs.insert_path(file_path.clone());
+
+        // Truncate to 5 bytes
+        let file = OpenOptions::new().write(true).open(&file_path).unwrap();
+        file.set_len(5).unwrap();
+
+        assert_eq!(fs::read(&file_path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn test_directory_operations() {
+        let temp_dir = create_temp_dir_for_test("test_directory_ops");
+        let fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+        // Create a test directory
+        let dir_path = create_test_dir(&temp_dir, "test_dir");
+        let _dir_ino = fs.insert_path(dir_path.clone());
+
+        // Create a file inside the test directory
+        let file_path = create_test_file(&dir_path, "test.txt", b"hello");
+        let _file_ino = fs.insert_path(file_path.clone());
+
+        // Verify directory structure
+        assert!(dir_path.is_dir());
+        assert!(file_path.is_file());
+        assert_eq!(fs::read(&file_path).unwrap(), b"hello");
+
+        // Test directory attributes
+        let dir_metadata = fs::metadata(&dir_path).unwrap();
+        assert!(dir_metadata.is_dir());
+
+        // Clean up
+        fs::remove_file(&file_path).unwrap();
+        fs::remove_dir(&dir_path).unwrap();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        // Existing test setup...
+
+        use crate::tests::{create_temp_dir_for_test, create_test_dir, create_test_file};
+        use crate::PassthroughFS;
+        use std::fs;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        #[test]
+        fn test_nested_directory_structure() {
+            let temp_dir = create_temp_dir_for_test("test_nested_dirs");
+            let _fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+            // Create nested directory structure
+            let parent_dir = create_test_dir(&temp_dir, "parent");
+            let child_dir = create_test_dir(&parent_dir, "child");
+            let grandchild_dir = create_test_dir(&child_dir, "grandchild");
+
+            // Create files at different levels
+            let file1 = create_test_file(&parent_dir, "file1.txt", b"level1");
+            let file2 = create_test_file(&child_dir, "file2.txt", b"level2");
+            let file3 = create_test_file(&grandchild_dir, "file3.txt", b"level3");
+
+            // Verify structure and contents
+            assert!(parent_dir.is_dir());
+            assert!(child_dir.is_dir());
+            assert!(grandchild_dir.is_dir());
+            assert_eq!(fs::read(&file1).unwrap(), b"level1");
+            assert_eq!(fs::read(&file2).unwrap(), b"level2");
+            assert_eq!(fs::read(&file3).unwrap(), b"level3");
+        }
+
+        #[test]
+        fn test_directory_permissions() {
+            let temp_dir = create_temp_dir_for_test("test_dir_perms");
+            let fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+            let dir_path = create_test_dir(&temp_dir, "restricted_dir");
+            let _dir_ino = fs.insert_path(dir_path.clone());
+
+            // Set restrictive permissions
+            fs::set_permissions(&dir_path, fs::Permissions::from_mode(0o700)).unwrap();
+            let metadata = fs::metadata(&dir_path).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+        }
+
+        #[test]
+        fn test_symlink_edge_cases() {
+            let temp_dir = create_temp_dir_for_test("test_symlink_edges");
+            let _fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+            // Test circular symlinks
+            let link1_path = temp_dir.join("link1");
+            let link2_path = temp_dir.join("link2");
+
+            std::os::unix::fs::symlink(&link2_path, &link1_path).unwrap();
+            std::os::unix::fs::symlink(&link1_path, &link2_path).unwrap();
+
+            // Test dangling symlink
+            let nonexistent = temp_dir.join("nonexistent");
+            let dangling_link = temp_dir.join("dangling");
+            std::os::unix::fs::symlink(&nonexistent, &dangling_link).unwrap();
+
+            // Use symlink_metadata instead of exists()
+            assert!(fs::symlink_metadata(&dangling_link).is_ok());
+            assert!(fs::read_link(&dangling_link).is_ok());
+        }
+
+        #[test]
+        fn test_file_operations_with_special_characters() {
+            let temp_dir = create_temp_dir_for_test("test_special_chars");
+            let _fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+            // Test files with spaces and special characters
+            let special_names = vec![
+                "file with spaces.txt",
+                "file_with_उनिकोड.txt",
+                "file_with_symbols!@#$%.txt",
+                ".hidden_file",
+            ];
+
+            for name in special_names {
+                let file_path = create_test_file(&temp_dir, name, b"content");
+                assert!(file_path.exists());
+                assert_eq!(fs::read(&file_path).unwrap(), b"content");
+            }
+        }
+
+        #[test]
+        fn test_concurrent_directory_access() {
+            let temp_dir = create_temp_dir_for_test("test_concurrent");
+            let _fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+            let dir_path = create_test_dir(&temp_dir, "shared_dir");
+
+            let handles: Vec<_> = (0..10)
+                .map(|i| {
+                    let dir = dir_path.clone();
+                    std::thread::spawn(move || {
+                        let file_path = dir.join(format!("file_{}.txt", i));
+                        fs::write(&file_path, format!("content_{}", i)).unwrap();
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            // Verify all files were created
+            assert_eq!(fs::read_dir(&dir_path).unwrap().count(), 10);
+        }
+
+        #[test]
+        fn test_empty_and_large_files() {
+            let temp_dir = create_temp_dir_for_test("test_file_sizes");
+            let _fs = PassthroughFS::new(temp_dir.clone(), "mapping.pipe".to_string());
+
+            // Test empty file
+            let empty_file = create_test_file(&temp_dir, "empty.txt", b"");
+            assert_eq!(fs::metadata(&empty_file).unwrap().len(), 0);
+
+            // Test large file (1MB)
+            let large_data = vec![0u8; 1024 * 1024];
+            let large_file = create_test_file(&temp_dir, "large.txt", &large_data);
+            assert_eq!(fs::metadata(&large_file).unwrap().len(), 1024 * 1024);
+        }
     }
 }

@@ -8,7 +8,31 @@ PassthroughFS is a FUSE-based filesystem written in Rust that allows users to mo
 - **JSON-based Configuration**: Define mappings and permissions in an easy-to-read JSON file.
 - **Dynamic Reloading**: Automatically reloads mappings when the configuration file changes.
 - **File Caching**: Optimized inode-level attribute caching for performance.
-- **Permission Control**: Optionally enforce permissions for mapped files.
+- **Permission Control**: Fully featured permission management including:
+   - File and directory permissions (chmod)
+   - Ownership management (chown)
+   - Access control enforcement
+- **Directory Operations**:
+   - Create and remove directories
+   - Rename directories and files
+   - Nested directory support
+- **Symbolic Links**:
+   - Create and manage symbolic links
+   - Handle circular and dangling links
+   - Preserve link attributes
+- **File Management**:
+   - File size modifications (truncate)
+   - Attribute preservation
+   - Special character support in filenames
+- **Filesystem Statistics**:
+   - Block and inode counting
+   - Space utilization reporting
+   - Filesystem capabilities
+- **Comprehensive Testing**:
+   - Edge case coverage
+   - Concurrent access testing
+   - Special character handling
+   - Performance validation
 - **Logging**: Provides detailed operation logs for debugging and monitoring.
 
 ## Requirements
@@ -162,6 +186,16 @@ Run the included test suite to verify functionality:
    ```bash
    cargo test
    ```
+The test suite covers:
+
+* Basic filesystem operations
+* Directory management
+* Permission controls
+* Symbolic link handling
+* Edge cases and error conditions
+* Concurrent access scenarios
+* Special character handling
+* File size variations
    
 ### Debugging
 Enable debug-level logs for detailed output:
@@ -186,3 +220,4 @@ This project is licensed under the following terms:
 * FUSE: Foundation for the filesystem integration.
 * The Rust community for their tools and libraries.
 * OpenAI's ChatGPT
+* Anthropic's Claude
