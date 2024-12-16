@@ -1,0 +1,419 @@
+syntax = "proto3";
+
+package pfs_hfs_bridge;
+
+import "google/protobuf/wrappers.proto"; // For optional fields
+
+// The main request message from PFS to HFS
+message MappingRequestMessage {
+  int32 version = 1;                // if missing default to 1
+  int64 timestamp = 2;              // Unix timestamp, if missing default to now
+  oneof message {
+    RequestVersion1Body v1 = 3;     // if missing, treat as ping and send back version
+  }
+}
+
+// The main request body for version 1
+message RequestVersion1Body {
+  string correlation_id = 1;        // uuid to match replies to requests, if missing leave empty
+  int32 offset = 2;                 // offset index, used for paging
+  int32 max = 3;                    // max number of results to return, used for paging
+  repeated MappingRequest requests = 4; // batched requests
+}
+
+// Types of requests, matching the implemented FUSE API calls
+enum RequestType {
+  LOOKUP_REQUEST = 0;
+  GETATTR_REQUEST = 1;
+  READ_REQUEST = 2;
+  WRITE_REQUEST = 3;
+  RELEASE_REQUEST = 4;
+  READDIR_REQUEST = 5;
+  CREATE_REQUEST = 6;
+  MKDIR_REQUEST = 7;
+  UNLINK_REQUEST = 8;
+  RMDIR_REQUEST = 9;
+  RENAME_REQUEST = 10;
+  SETATTR_REQUEST = 11;
+  SYMLINK_REQUEST = 12;
+  READLINK_REQUEST = 13;
+  FSYNC_REQUEST = 14;
+  FSYNCDIR_REQUEST = 15;
+  FLUSH_REQUEST = 16;
+  STATFS_REQUEST = 17;
+}
+
+// A single request item
+message MappingRequest {
+  MappingMessage message = 1;    // current mapping state, sent with the request
+  RequestType type = 2;
+  oneof requested {
+    LookupMappingRequest lookup = 3;
+    GetattrMappingRequest getattr = 4;
+    ReadMappingRequest read = 5;
+    WriteMappingRequest write = 6;
+    ReleaseMappingRequest release = 7;
+    ReaddirMappingRequest readdir = 8;
+    CreateMappingRequest create = 9;
+    MkdirMappingRequest mkdir = 10;
+    UnlinkMappingRequest unlink = 11;
+    RmdirMappingRequest rmdir = 12;
+    RenameMappingRequest rename = 13;
+    SetattrMappingRequest setattr = 14;
+    SymlinkMappingRequest symlink = 15;
+    ReadlinkMappingRequest readlink = 16;
+    FsyncMappingRequest fsync = 17;
+    FsyncdirMappingRequest fsyncdir = 18;
+    FlushMappingRequest flush = 19;
+    StatfsMappingRequest statfs = 20;
+  }
+}
+
+// ******************************
+// FUSE Request/Reply Structures
+// ******************************
+
+// Common request information, similar to FUSE's Request
+message FuseRequestContext {
+  uint64 unique = 1;  // unique request id
+  uint32 uid = 2;     // user id
+  uint32 gid = 3;     // group id
+  uint32 pid = 4;     // process id
+}
+
+// Lookup request
+message LookupMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3; // UTF-8 filename
+}
+
+// Getattr request
+message GetattrMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  google.protobuf.UInt64Value fh = 3; // optional filehandle
+}
+
+// Read request
+message ReadMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int64 offset = 4;
+  uint32 size = 5;
+  int32 flags = 6;
+  google.protobuf.UInt64Value lock_owner = 7; // optional
+}
+
+// Write request
+message WriteMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int64 offset = 4;
+  bytes data = 5;
+  uint32 size = 6;
+  int32 flags = 7;
+  google.protobuf.UInt64Value lock_owner = 8;
+}
+
+// Release request
+message ReleaseMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int32 flags = 4;
+  google.protobuf.UInt64Value lock_owner = 5;
+  bool flush = 6;
+}
+
+// Readdir request
+message ReaddirMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int64 offset = 4;
+  // PFS will handle paging using offset/max; this request may be called multiple times. The PFS will keep the offsets 
+  // aligned between this and the offset/max in the message envelope (RequestVersion1Body).
+}
+
+// Create request
+message CreateMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  uint32 mode = 4;
+  uint32 umask = 5;
+  int32 flags = 6;
+}
+
+// Mkdir request
+message MkdirMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  uint32 mode = 4;
+  uint32 umask = 5;
+}
+
+// Unlink request
+message UnlinkMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+}
+
+// Rmdir request
+message RmdirMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+}
+
+// Rename request
+message RenameMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  uint64 newparent = 4;
+  string newname = 5;
+  uint32 flags = 6; // kernel-like rename flags bitfield
+}
+
+// Setattr request
+// We'll store all optional attributes in a single message, using optional wrappers:
+message SetattrFields {
+  google.protobuf.UInt32Value mode = 1;
+  google.protobuf.UInt32Value uid = 2;
+  google.protobuf.UInt32Value gid = 3;
+  google.protobuf.UInt64Value size = 4;
+  // TimeOrNow and SystemTime as fuse does: timespec with sec/nsec
+  message TimeSpecOrNow {
+    bool now = 1;
+    int64 sec = 2;
+    uint32 nsec = 3;
+  }
+  // Only include fields that are set
+  TimeSpecOrNow atime = 5;
+  TimeSpecOrNow mtime = 6;
+  TimeSpecOrNow ctime = 7;
+  TimeSpecOrNow crtime = 8;
+  TimeSpecOrNow chgtime = 9;
+  TimeSpecOrNow bkuptime = 10;
+  google.protobuf.UInt32Value flags = 11;
+}
+
+message SetattrMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  google.protobuf.UInt64Value fh = 3;
+  SetattrFields attrs = 4;
+}
+
+// Symlink request
+message SymlinkMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  string link = 4; // target path
+}
+
+// Readlink request
+message ReadlinkMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+}
+
+// Fsync request
+message FsyncMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  bool datasync = 4;
+}
+
+// Fsyncdir request
+message FsyncdirMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  bool datasync = 4;
+}
+
+// Flush request
+message FlushMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  uint64 lock_owner = 4;
+}
+
+// Statfs request
+message StatfsMappingRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+}
+
+// ******************************
+// Replies
+// ******************************
+
+enum ReplyType {
+  ATTR_REPLY = 0;
+  READ_REPLY = 1;
+  WRITE_REPLY = 2;
+  ENTRY_REPLY = 3;
+  EMPTY_REPLY = 4;
+  DIRECTORY_REPLY = 5;
+  CREATE_REPLY = 6;
+  STATFS_REPLY = 7;
+  LINK_REPLY = 8; // For readlink
+}
+
+// Common structures from FUSE for replies:
+
+// File types
+enum FileType {
+  UNKNOWN = 0;
+  REGULAR = 1;
+  DIRECTORY = 2;
+  SYMLINK = 3;
+  BLOCKDEV = 4;
+  CHARDEV = 5;
+  FIFO = 6;
+  SOCKET = 7;
+}
+
+// File attributes corresponding to Fuse FileAttr
+message FileAttr {
+  uint64 ino = 1;
+  uint64 size = 2;
+  uint64 blocks = 3;
+  int64 atime_sec = 4;
+  uint32 atime_nsec = 5;
+  int64 mtime_sec = 6;
+  uint32 mtime_nsec = 7;
+  int64 ctime_sec = 8;
+  uint32 ctime_nsec = 9;
+  int64 crtime_sec = 10;
+  uint32 crtime_nsec = 11;
+  uint32 mode = 12;
+  uint32 nlink = 13;
+  uint32 uid = 14;
+  uint32 gid = 15;
+  uint32 rdev = 16;
+  uint32 flags = 17;
+}
+
+// ReplyAttr (from getattr or setattr)
+message ReplyAttr {
+  FileAttr attr = 1;
+  int64 attr_valid_sec = 2;
+  uint32 attr_valid_nsec = 3;
+}
+
+// ReplyEntry (from lookup, mkdir, symlink, create)
+message ReplyEntry {
+  uint64 nodeid = 1;
+  uint64 generation = 2;
+  int64 entry_valid_sec = 3;
+  uint32 entry_valid_nsec = 4;
+  int64 attr_valid_sec = 5;
+  uint32 attr_valid_nsec = 6;
+  FileAttr attr = 7;
+}
+
+// ReplyData (from read, readlink)
+message ReplyData {
+  bytes data = 1; // raw data read
+}
+
+// ReplyWrite (from write)
+message ReplyWrite {
+  uint32 size = 1; // number of bytes written
+}
+
+// ReplyEmpty (for operations that have no specific reply data)
+message ReplyEmpty {}
+
+// DirectoryEntry for readdir
+message DirectoryEntry {
+  uint64 ino = 1;
+  uint64 offset = 2;
+  FileType type = 3;
+  string name = 4; // UTF-8 filename
+}
+
+// ReplyDirectory (from readdir)
+message ReplyDirectory {
+  repeated DirectoryEntry entries = 1;
+}
+
+// ReplyCreate (from create)
+message ReplyCreate {
+  ReplyEntry entry = 1;
+  uint64 fh = 2;
+  uint32 flags = 3;
+}
+
+// ReplyStatfs (from statfs)
+message Statfs {
+  uint64 blocks = 1;
+  uint64 bfree = 2;
+  uint64 bavail = 3;
+  uint64 files = 4;
+  uint64 ffree = 5;
+  uint32 bsize = 6;
+  uint32 namelen = 7;
+  uint32 frsize = 8;
+}
+
+message ReplyStatfs {
+  Statfs statfs = 1;
+}
+
+message ReplyLink {
+  string link = 1; // The symbolic link path as a string
+}
+
+// The top-level reply wrapper
+message Reply {
+  ReplyType type = 1;
+  oneof result {
+    ReplyAttr attr = 2;
+    ReplyData data = 3;
+    ReplyWrite write = 4;
+    ReplyEntry entry = 5;
+    ReplyEmpty empty = 6;
+    ReplyDirectory directory = 7;
+    ReplyCreate create = 8;
+    ReplyStatfs statfs = 9;
+    ReplyLink link = 10;
+  }
+}
+
+// The main mapping message for responses from HFS to PFS
+message MappingMessage {
+  int32 version = 1;                // if missing default to 1
+  int64 timestamp = 2;              // Unix timestamp, if missing default to now
+  oneof message_body {
+    Version1Body v1 = 3;            // if missing, treat as ping and send back version
+  }
+}
+
+message Version1Body {
+  string correlation_id = 1;        // uuid to match replies to requests, if missing leave empty
+  int32 offset = 2;                 // current offset passed in the request
+  int32 remain = 3;                 // remaining results in the paged message response
+  repeated Mapping mappings = 4;    // List of mappings. If missing (ping), send current timestamp and same correlation if present.
+  repeated Reply replies = 5;       // list of replies (for batched requests)
+}
+
+// Mappings can modify how future calls are handled by PFS.
+message Mapping {
+  string path = 1;     // Key (e.g., "/example/path")
+  string target = 2;   // Value (e.g., "/real/target/path"), optional for REMOVE
+  string opaque = 3;   // UTF-8 compatible opaque metadata, up to 16KB, no validation required
+  string delete = 4;   // If non-blank, consider this a deleted mapping
+}
