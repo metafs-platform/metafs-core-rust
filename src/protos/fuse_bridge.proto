@@ -1,0 +1,550 @@
+syntax = "proto3";
+
+package fuse_bridge;
+
+// ******************************************************************
+// SERVICE DEFINITION
+// ******************************************************************
+service FuseBridge {
+  // A simple unary RPC that carries one or more FUSE requests
+  // and returns the corresponding responses.
+  rpc HandleRequests(FilesystemRequestMessage) returns (FilesystemResponseMessage);
+}
+
+// ******************************************************************
+// CORE MESSAGES
+// ******************************************************************
+
+// The main data structure used by the PFS. Usually a virtual file,
+// but can represent an existing file.
+message FilesystemMapping {
+  string path = 1;     // Key (e.g., "/example/path")
+  string target = 2;   // Value (e.g., "/real/target/path"), optional for REMOVE
+  string opaque = 3;   // UTF-8 compatible opaque metadata, up to 16KB
+  string delete = 4;   // If non-blank, consider this a deleted mapping
+}
+
+// The main request message from PFS to HFS
+message FilesystemRequestMessage {
+  int64 timestamp = 1;                  // Unix timestamp, if not set, application logic will default to now
+  oneof body {
+    FilesystemRequestV1Body v1 = 2;     // if missing, treat as ping and send back version
+  }
+}
+
+// The main request body for version 1
+message FilesystemRequestV1Body {
+  string correlation_id = 1;                  // uuid to match replies to requests, if missing leave empty
+  repeated FilesystemRequest requests = 2;    // requests, potentially batched
+}
+
+// A single request item
+message FilesystemRequest {
+  // The mapping (virtual file) that is triggering the request
+  FilesystemMapping mapping = 1;
+  // The fuse data for the request
+  oneof requested {
+    LookupRequest lookup = 2;
+    GetattrRequest getattr = 3;
+    ReadRequest read = 4;
+    WriteRequest write = 5;
+    ReleaseRequest release = 6;
+    ReaddirRequest readdir = 7;
+    CreateRequest create = 8;
+    MkdirRequest mkdir = 9;
+    UnlinkRequest unlink = 10;
+    RmdirRequest rmdir = 11;
+    RenameRequest rename = 12;
+    SetattrRequest setattr = 13;
+    SymlinkRequest symlink = 14;
+    ReadlinkRequest readlink = 15;
+    FsyncRequest fsync = 16;
+    FsyncdirRequest fsyncdir = 17;
+    FlushRequest flush = 18;
+    StatfsRequest statfs = 19;
+    InitRequest init = 20;
+    DestroyRequest destroy = 21;
+    AccessRequest access = 22;
+    MknodRequest mknod = 23;
+    LinkRequest link = 24;
+    OpendirRequest opendir = 25;
+    ReleasedirRequest releasedir = 26;
+    InterruptRequest interrupt = 27;
+    PollRequest poll = 28;
+    BmapRequest bmap = 29;
+    FallocateRequest fallocate = 30;
+    CopyFileRangeRequest copyfile = 31;
+    LseekRequest lseek = 32;
+  }
+}
+
+// The main mapping message for responses from HFS to PFS
+message FilesystemResponseMessage {
+  int64 timestamp = 1;                        // Unix timestamp, if not set, application logic will default to now
+  oneof body {
+    FilesystemResponseV1Body v1 = 2;            // if missing, treat as ping and send back version info of 
+  }
+}
+
+message FilesystemResponseV1Body {
+  string correlation_id = 1;                  // uuid to match replies to requests, if missing leave empty
+  repeated FilesystemResponse responses = 2;  // list of replies (for batched requests)
+  repeated FilesystemMapping mappings = 3;    // List of mappings. If missing (ping), send current timestamp and same correlation if present.
+}
+
+// A single response to one request
+message FilesystemResponse {
+  // If error is non-zero, then the response indicates a failure.
+  // This is a typical pattern for returning POSIX/FUSE-style errno codes.
+  ErrorResponse error = 1;
+
+  // If error.code == 0, you can interpret the 'result' to get the successful data.
+  oneof result {
+    AttrResponse attr = 2;
+    FileReadResponse read = 3;
+    FileWriteResponse write = 4;
+    NodeResponse entry = 5;
+    EmptyResponse empty = 6;
+    ReadDirResponse directory = 7;
+    CreateResponse create = 8;
+    StatfsResponse statfs = 9;
+    LinkResponse link = 10;
+    InitResponse init = 20;
+    PollResponse poll = 21;
+    BmapResponse bmap = 22;
+    LseekResponse lseek = 23;
+  }
+}
+
+// ******************************************************************
+// ERROR STRUCTURE
+// ******************************************************************
+
+// A simple error structure so you can return typical errno or
+// FUSE error codes, plus an optional message for debugging/logs.
+message ErrorResponse {
+  int32 code = 1;       // e.g. 0 = success, non-zero for typical -errno
+  string message = 2;   // optional textual error detail
+}
+
+// ******************************************************************
+// FUSE REQUEST MESSAGES
+// ******************************************************************
+
+// Common request information, similar to FUSE's Request
+message FuseRequestContext {
+  uint64 unique = 1;  // unique request id
+  uint32 uid = 2;     // user id
+  uint32 gid = 3;     // group id
+  uint32 pid = 4;     // process id
+}
+
+// Lookup request
+message LookupRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3; // UTF-8 filename
+}
+
+// Getattr request
+message GetattrRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  optional uint64 fh = 3;
+}
+
+// Read request
+message ReadRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int64 offset = 4;
+  uint32 size = 5;
+  int32 flags = 6;
+  optional int64 lock_owner = 7;
+}
+
+// Write request
+message WriteRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int64 offset = 4;
+  bytes data = 5;
+  uint32 size = 6;
+  int32 flags = 7;
+  optional uint64 lock_owner = 8;
+}
+
+// Release request
+message ReleaseRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int32 flags = 4;
+  optional uint64 lock_owner = 5;
+  bool flush = 6;
+}
+
+// Readdir request
+message ReaddirRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int64 offset = 4;
+}
+
+// Create request
+message CreateRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  uint32 mode = 4;
+  uint32 umask = 5;
+  int32 flags = 6;
+}
+
+// Mkdir request
+message MkdirRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  uint32 mode = 4;
+  uint32 umask = 5;
+}
+
+// Unlink request
+message UnlinkRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+}
+
+// Rmdir request
+message RmdirRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+}
+
+// Rename request
+message RenameRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  uint64 newparent = 4;
+  string newname = 5;
+  uint32 flags = 6; // kernel-like rename flags bitfield
+}
+
+// Setattr request
+message SetattrRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  optional uint64 fh = 3;
+  SetattrFields attrs = 4;
+}
+
+// We'll store all optional attributes in a single message, using optional wrappers:
+message SetattrFields {
+  optional uint32 mode = 1;
+  optional uint32 uid = 2;
+  optional uint32 gid = 3;
+  optional uint64 size = 4;
+  // TimeOrNow and SystemTime as fuse does: timespec with sec/nsec
+  message TimeSpecOrNow {
+    bool now = 1;
+    int64 sec = 2;
+    uint32 nsec = 3;
+  }
+  // Only include fields that are set
+  TimeSpecOrNow atime = 5;
+  TimeSpecOrNow mtime = 6;
+  TimeSpecOrNow ctime = 7;
+  TimeSpecOrNow crtime = 8;
+  TimeSpecOrNow chgtime = 9;
+  TimeSpecOrNow bkuptime = 10;
+  optional uint32 flags = 11;
+}
+
+// Symlink request
+message SymlinkRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  string link = 4; // target path
+}
+
+// Readlink request
+message ReadlinkRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+}
+
+// Fsync request
+message FsyncRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  bool datasync = 4;
+}
+
+// Fsyncdir request
+message FsyncdirRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  bool datasync = 4;
+}
+
+// Flush request
+message FlushRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  uint64 lock_owner = 4;
+}
+
+// Statfs request
+message StatfsRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+}
+
+// -- Access request (FUSE_ACCESS) --
+message AccessRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint32 mask = 3; // The access mask (R_OK, W_OK, X_OK bits)
+}
+
+// -- Mknod request (FUSE_MKNOD) --
+message MknodRequest {
+  FuseRequestContext request = 1;
+  uint64 parent = 2;
+  string name = 3;
+  uint32 mode = 4;     // File type + permissions
+  uint32 rdev = 5;     // Device number (for block/char dev)
+  uint32 umask = 6;
+}
+
+// -- Link request (FUSE_LINK) --
+message LinkRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;       // Existing inode to link to
+  uint64 newparent = 3; // Directory where the new link should be created
+  string newname = 4;   // Name of the new link
+}
+
+// -- Opendir request (FUSE_OPENDIR) --
+message OpendirRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  int32 flags = 3; // Maybe store open flags if relevant
+}
+
+// -- Releasedir request (FUSE_RELEASEDIR) --
+message ReleasedirRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int32 flags = 4;
+}
+
+// -- Init request (FUSE_INIT) --
+message InitRequest {
+  FuseRequestContext request = 1;
+  uint32 proto_major = 2;       // FUSE protocol major version
+  uint32 proto_minor = 3;       // FUSE protocol minor version
+  uint32 max_readahead = 4;
+  uint32 flags = 5;             // FUSE_INIT_* flags
+}
+
+// -- Destroy request (FUSE_DESTROY) --
+message DestroyRequest {
+  FuseRequestContext request = 1;
+  // Typically no additional fields
+}
+
+// -- Interrupt request (FUSE_INTERRUPT) --
+message InterruptRequest {
+  FuseRequestContext request = 1;
+  uint64 unique = 2;  // ID of the request to interrupt
+}
+
+// -- Poll request (FUSE_POLL) --
+message PollRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  uint64 kh = 4; // Kernel poll handle
+  uint32 events = 5; // Requested events (e.g. POLLIN, POLLOUT)
+}
+
+// -- Bmap request (FUSE_BMAP) --
+message BmapRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 block = 3;  // Block index
+  uint32 blocksize = 4;
+}
+
+// -- Fallocate request (FUSE_FALLOCATE) --
+message FallocateRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  uint64 offset = 4;
+  uint64 length = 5;
+  uint32 mode = 6; // FALLOC_FL_KEEP_SIZE, etc.
+}
+
+// -- CopyFileRange request (FUSE_COPY_FILE_RANGE) --
+message CopyFileRangeRequest {
+  FuseRequestContext request = 1;
+  uint64 ino_in = 2;
+  uint64 fh_in = 3;
+  uint64 off_in = 4;
+  uint64 ino_out = 5;
+  uint64 fh_out = 6;
+  uint64 off_out = 7;
+  uint64 len = 8;
+  uint32 flags = 9;
+}
+
+// -- Lseek request (FUSE_LSEEK) --
+message LseekRequest {
+  FuseRequestContext request = 1;
+  uint64 ino = 2;
+  uint64 fh = 3;
+  int64 offset = 4;
+  uint32 whence = 5; // SEEK_SET, SEEK_CUR, SEEK_END
+}
+
+// ******************************************************************
+// FUSE RESPONSE MESSAGES
+// ******************************************************************
+
+// File attributes corresponding to Fuse FileAttr
+message FileAttr {
+  uint64 ino = 1;
+  uint64 size = 2;
+  uint64 blocks = 3;
+  int64 atime_sec = 4;
+  uint32 atime_nsec = 5;
+  int64 mtime_sec = 6;
+  uint32 mtime_nsec = 7;
+  int64 ctime_sec = 8;
+  uint32 ctime_nsec = 9;
+  int64 crtime_sec = 10;
+  uint32 crtime_nsec = 11;
+  uint32 mode = 12;
+  uint32 nlink = 13;
+  uint32 uid = 14;
+  uint32 gid = 15;
+  uint32 rdev = 16;
+  uint32 flags = 17;
+}
+
+// AttrResponse (from getattr or setattr)
+message AttrResponse {
+  FileAttr attr = 1;
+  int64 attr_valid_sec = 2;
+  uint32 attr_valid_nsec = 3;
+}
+
+// NodeResponse (from lookup, mkdir, symlink, create)
+message NodeResponse {
+  uint64 nodeid = 1;
+  uint64 generation = 2;
+  int64 entry_valid_sec = 3;
+  uint32 entry_valid_nsec = 4;
+  int64 attr_valid_sec = 5;
+  uint32 attr_valid_nsec = 6;
+  FileAttr attr = 7;
+}
+
+// ReadResponse (from read, readlink)
+message FileReadResponse {
+  bytes data = 1; // raw data read
+}
+
+// WriteResponse (from write)
+message FileWriteResponse {
+  uint32 size = 1; // number of bytes written
+}
+
+// EmptyResponse (for operations that have no specific reply data)
+message EmptyResponse {}
+
+// ReadDirResponse (from readdir)
+message ReadDirResponse {
+  repeated DirectoryEntry entries = 1;
+}
+
+// DirectoryEntry for readdir
+message DirectoryEntry {
+  uint64 ino = 1;
+  uint64 offset = 2;
+  FileType type = 3;
+  string name = 4; // UTF-8 filename
+}
+
+// File types
+enum FileType {
+  UNKNOWN = 0;
+  REGULAR = 1;
+  DIRECTORY = 2;
+  SYMLINK = 3;
+  BLOCKDEV = 4;
+  CHARDEV = 5;
+  FIFO = 6;
+  SOCKET = 7;
+}
+
+// CreateResponse (from create)
+message CreateResponse {
+  NodeResponse entry = 1;
+  uint64 fh = 2;
+  uint32 flags = 3;
+}
+
+// StatfsResponse (from statfs)
+message StatfsResponse {
+  uint64 blocks = 1;
+  uint64 bfree = 2;
+  uint64 bavail = 3;
+  uint64 files = 4;
+  uint64 ffree = 5;
+  uint32 bsize = 6;
+  uint32 namelen = 7;
+  uint32 frsize = 8;
+}
+
+// For LinkRequest (though typically used for symlinks too, if desired)
+message LinkResponse {
+  string link = 1; // The symbolic link path as a string
+}
+
+// For InitRequest
+message InitResponse {
+  uint32 proto_major = 1;
+  uint32 proto_minor = 2;
+  uint32 max_readahead = 3;
+  uint32 flags = 4; // FUSE init flags
+}
+
+// For PollRequest
+message PollResponse {
+  uint32 revents = 1; // Which events occurred
+}
+
+// For BmapRequest
+message BmapResponse {
+  uint64 block = 1; // Physical block number
+}
+
+// For LseekRequest
+message LseekResponse {
+  int64 offset = 1; // The resulting offset
+}

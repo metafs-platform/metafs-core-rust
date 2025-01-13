@@ -32,6 +32,11 @@ use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use r2d2::{ManageConnection, Pool};
 use serde::{Deserialize, Serialize};
+use tracing_subscriber::EnvFilter;
+
+mod named_pipe;
+mod proto_bridge;
+//use proto_bridge::{send, receive};
 
 const BLOCK_SIZE: u32 = 4096;
 
@@ -179,6 +184,7 @@ impl PassthroughFS {
         conn
     }
 
+    #[allow(dead_code)]
     fn get_pool_metrics(&self) -> PoolMetrics {
         PoolMetrics {
             active_connections: AtomicU64::new(self.connection_pool.state().connections as u64),
@@ -325,66 +331,45 @@ fn read_exact_bytes<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<bool>
     Ok(true)
 }
 
-/// Reads a length-prefixed JSON message from `reader`.
+/// Reads a length-prefixed JSON message from `reader`, handling non-blocking reads.
 fn read_length_prefixed_json<R: Read>(reader: &mut R) -> io::Result<Option<String>> {
     let mut length_buf = [0u8; 4];
+    let mut offset = 0;
+
     debug!("read_length_prefixed_json: Attempting to read length prefix");
+    debug!(
+        "read_length_prefixed_json: Length prefix bytes: {:?}",
+        length_buf
+    );
 
-    let prefix_result = read_exact_bytes(reader, &mut length_buf);
-    match prefix_result {
-        Ok(true) => {
-            // Successfully read the length prefix
-            debug!("read_length_prefixed_json: Length prefix read successfully");
-            let length = u32::from_be_bytes(length_buf) as usize;
-            let mut payload = vec![0; length];
-
-            let payload_result = read_exact_bytes(reader, &mut payload);
-            match payload_result {
-                Ok(true) => {
-                    // Fully read the payload
-                    let s = String::from_utf8(payload)
-                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8"))?;
-                    debug!(
-                        "read_length_prefixed_json: Read payload of length {}",
-                        length
-                    );
-                    debug!("read_length_prefixed_json: Payload string: {}", s);
-                    Ok(Some(s))
-                }
-                Ok(false) => {
-                    debug!(
-                        "read_length_prefixed_json: EOF reached before payload could be fully read"
-                    );
-                    Ok(None)
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    debug!(
-                        "read_length_prefixed_json: No data available yet (WouldBlock) for payload"
-                    );
-                    Ok(None)
-                }
-                Err(e) => {
-                    debug!("read_length_prefixed_json: Error reading payload: {:?}", e);
-                    Err(e)
-                }
-            }
-        }
-        Ok(false) => {
-            debug!("read_length_prefixed_json: EOF reached before length prefix could be read");
-            Ok(None)
-        }
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-            debug!("read_length_prefixed_json: No data available yet (WouldBlock) for prefix");
-            Ok(None)
-        }
-        Err(e) => {
-            debug!(
-                "read_length_prefixed_json: Error reading length prefix: {:?}",
-                e
-            );
-            Err(e)
+    // Read the length prefix
+    while offset < 4 {
+        match reader.read(&mut length_buf[offset..]) {
+            Ok(0) => return Ok(None), // EOF
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue, // Retry on WouldBlock
+            Err(e) => return Err(e),
         }
     }
+
+    let length = u32::from_be_bytes(length_buf) as usize;
+    let mut payload = vec![0; length];
+    let mut offset = 0;
+
+    // Read the JSON payload
+    while offset < length {
+        match reader.read(&mut payload[offset..]) {
+            Ok(0) => return Ok(None), // EOF
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue, // Retry on WouldBlock
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Convert to UTF-8 string
+    String::from_utf8(payload)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-8"))
 }
 
 fn open_nonblocking_pipe(path: &str) -> io::Result<fs::File> {
@@ -450,48 +435,26 @@ fn reload_mappings(fs: &PassthroughFS) {
 
     // Attempt to read non-blocking
     match read_length_prefixed_json(&mut fifo) {
-        Ok(Some(json_str)) => match serde_json::from_str::<HashMap<String, Mapping>>(&json_str) {
-            Ok(parsed) => {
-                debug!(
-                    "reload_mappings: Parsed {} mappings: {:?}",
-                    parsed.len(),
-                    parsed.keys()
-                );
-                let mut mappings = fs.file_mapping.write().unwrap();
-                mappings.clear();
-                mappings.extend(parsed);
-                {
-                    let mut lm = fs.last_modified.write().unwrap();
-                    *lm = Some(modified);
-                    let mut ls = fs.last_size.write().unwrap();
-                    *ls = Some(size);
+        Ok(Some(json_str)) => {
+            debug!("reload_mappings: Received JSON: {}", json_str);
+            match serde_json::from_str::<HashMap<String, Mapping>>(&json_str) {
+                Ok(parsed) => {
+                    debug!("reload_mappings: Parsed mappings: {:?}", parsed.keys());
+                    let mut mappings = fs.file_mapping.write().unwrap();
+                    mappings.clear();
+                    mappings.extend(parsed);
+                    *fs.last_modified.write().unwrap() = Some(modified);
+                    *fs.last_size.write().unwrap() = Some(size);
+                    fs.invalidate_all_attrs();
+                    info!("Mappings successfully reloaded.");
                 }
-                info!(
-                    "Mappings successfully reloaded: {:?}",
-                    mappings.keys().collect::<Vec<_>>()
-                );
-                fs.invalidate_all_attrs();
+                Err(err) => {
+                    warn!("Failed to parse JSON: {:?}, Error: {:?}", json_str, err);
+                }
             }
-            Err(err) => {
-                warn!(
-                    "Failed to parse JSON from named pipe {}: {:?}",
-                    fs.mapping_file, err
-                );
-            }
-        },
-        Ok(None) => {
-            // No complete message available
-            debug!("No complete message available in non-blocking pipe");
         }
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            debug!("No data available in non-blocking pipe right now");
-        }
-        Err(err) => {
-            warn!(
-                "Error reading from named pipe {}: {:?}",
-                fs.mapping_file, err
-            );
-        }
+        Ok(None) => debug!("No complete message in non-blocking pipe."),
+        Err(err) => warn!("Error reading from pipe: {:?}", err),
     }
 }
 
@@ -660,7 +623,7 @@ impl Filesystem for MyFS {
             match file.write_at(data, offset as u64) {
                 Ok(bytes_written) => {
                     // Fine-grained invalidation: the file changed
-                    fs.invalidate_attr(ino); 
+                    fs.invalidate_attr(ino);
                     reply.written(bytes_written as u32);
                     return;
                 }
@@ -1374,8 +1337,20 @@ impl Filesystem for MyFS {
     }
 }
 
+pub fn init_tracing() {
+    let json_format = tracing_subscriber::fmt()
+        .json()
+        .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_current_span(false)
+        .flatten_event(true);
+
+    json_format.init();
+}
+
 fn main() {
     env_logger::init();
+    init_tracing();
 
     let matches = Command::new("PassthroughFS")
         .version("1.0")
@@ -1426,10 +1401,11 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
     use std::process::Command;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::thread::JoinHandle;
     use std::time::Duration;
+
     use test_log::test;
 
     use crate::PassthroughFS;
@@ -1489,25 +1465,24 @@ mod tests {
         panic!("Test timed out waiting for non-blocking pipe operation");
     }
 
-    // Integration test for named pipe:
-    // 1. Create a named pipe using `mkfifo`.
-    // 2. Write a length-prefixed JSON payload to the pipe.
-    // 3. Call reload_mappings and verify the mappings are loaded.
-    //#[test] - disabled, needs thread to open read and write of queue
+    //#[test]
     fn test_reload_mappings_from_pipe() {
         let temp_dir = create_temp_dir_for_test("test_reload_mappings_from_pipe");
         let pipe_path = temp_dir.join("mapping.pipe");
 
-        // Create FIFO (mkfifo)
+        // Create FIFO (named pipe)
         let status = Command::new("mkfifo")
             .arg(&pipe_path)
             .status()
-            .expect("Failed to run mkfifo");
+            .expect("Failed to create named pipe using mkfifo");
         assert!(status.success(), "mkfifo should succeed");
 
-        let fs = PassthroughFS::new(temp_dir.clone(), pipe_path.to_string_lossy().to_string());
+        let fs = Arc::new(PassthroughFS::new(
+            temp_dir.clone(),
+            pipe_path.to_string_lossy().to_string(),
+        ));
 
-        // Prepare a mapping
+        // Prepare JSON data to send through the pipe
         let mappings = HashMap::from([
             (
                 "/foo".to_string(),
@@ -1526,53 +1501,82 @@ mod tests {
         ]);
 
         let json_data = serde_json::to_string(&mappings).unwrap();
-        let length = json_data.len() as u32;
+        let length_prefix = (json_data.len() as u32).to_be_bytes(); // 4-byte length prefix
         let mut payload = Vec::new();
-        payload.extend_from_slice(&length.to_be_bytes());
+        payload.extend_from_slice(&length_prefix);
         payload.extend_from_slice(json_data.as_bytes());
 
-        eprintln!("test_reload_mappings_from_pipe: opening reader file");
-        let reader = OpenOptions::new()
-            .read(true)
-            .open(&pipe_path)
-            .expect("Failed to open pipe for reading");
-        
-        eprintln!("test_reload_mappings_from_pipe: opening write file");
-        let mut writer = OpenOptions::new()
-            .write(true)
-            .open(&pipe_path)
-            .expect("Failed to open pipe for writing");
-        
-        eprintln!("test_reload_mappings_from_pipe: write all");
-        writer.write_all(&payload).expect("Failed to write to pipe");
-        
-        eprintln!("test_reload_mappings_from_pipe: write flush");
-        writer.flush().expect("Failed to flush writer");
-        
-        eprintln!("test_reload_mappings_from_pipe: writer drop");
-        drop(writer); // CLOSE the writer end here!
+        // Synchronization barrier for writer and reader threads
+        let barrier = Arc::new(Barrier::new(2));
 
-        eprintln!("test_reload_mappings_from_pipe: reader drop");
-        drop(reader);
+        // Writer thread
+        let writer_path = pipe_path.clone();
+        let writer_barrier = barrier.clone();
+        let writer_thread = std::thread::spawn(move || {
+            eprintln!("Writer: Opening pipe for writing...");
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("Failed to open pipe for writing");
 
-        eprintln!("test_reload_mappings_from_pipe: Writer closed");
+            eprintln!("Writer: Writing payload to pipe...");
+            writer.write_all(&payload).expect("Failed to write payload");
+            writer.flush().expect("Failed to flush writer");
 
-        // Now attempt to reload mappings multiple times until data is read
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(2);
+            eprintln!("Writer: Payload written successfully, dropping writer...");
+            drop(writer);
+
+            // Synchronize with the reader
+            writer_barrier.wait();
+        });
+
+        // Reader thread
+        let reader_path = pipe_path.clone();
+        let reader_barrier = barrier.clone();
+        let reader_thread = std::thread::spawn(move || {
+            eprintln!("Reader: Opening pipe for reading...");
+            let mut reader = OpenOptions::new()
+                .read(true)
+                .open(&reader_path)
+                .expect("Failed to open pipe for reading");
+
+            // Fully read and debug the payload
+            let mut buffer = Vec::new();
+            reader
+                .read_to_end(&mut buffer)
+                .expect("Failed to read data from pipe");
+            eprintln!("Reader: Data read: {:?}", buffer);
+
+            // Synchronize with writer thread
+            reader_barrier.wait();
+            drop(reader);
+            eprintln!("Reader: Pipe read and closed successfully.");
+        });
+
+        // Wait for both threads to complete
+        writer_thread.join().expect("Writer thread failed");
+        reader_thread.join().expect("Reader thread failed");
+
+        eprintln!("Both writer and reader threads have completed successfully.");
+
+        // Retry reloading mappings until they are parsed correctly
+        let start_time = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+
         loop {
-            eprintln!("test_reload_mappings_from_pipe: Calling reload_mappings()");
+            eprintln!("Main: Calling reload_mappings...");
             reload_mappings(&fs);
-            eprintln!("test_reload_mappings_from_pipe: reload_mappings returned, checking keys");
+
             let loaded = fs.file_mapping.read().unwrap();
-            debug!("reload_mappings: Current mappings: {:?}", loaded.keys());
+            eprintln!("Main: Current mappings: {:?}", loaded);
+
             if loaded.contains_key("/foo") && loaded.contains_key("/bar") {
-                // Test passed
-                break;
+                eprintln!("Test passed: Mappings successfully loaded!");
+                return; // Test passed
             }
 
-            if start.elapsed() > timeout {
-                panic!("Timed out waiting for mappings to load");
+            if start_time.elapsed() > timeout {
+                panic!("Test failed: Timed out while waiting for mappings to load.");
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

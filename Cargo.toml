@@ -17,6 +17,21 @@ env_logger = "0.11.5"
 r2d2 = "0.8.10"
 num_cpus = "1.16.0"
 test-log = "0.2.16"
+prost = "0.13.4"
+prost-build = "0.13.4"
+prost-types = "0.13.4"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1.11.0", features = ["v4"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json", "time"] } 
+json-subscriber = "0.2.4"
+rustix = "0.38.42"
+tempfile = "3.14.0"
+
+[build-dependencies]
+prost-build = "0.13.4"
+
+
 
 
 
